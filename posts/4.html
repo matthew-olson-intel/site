@@ -1,0 +1,159 @@
+<head>
+<link rel="stylesheet" href="../style.css">
+</head>
+
+<h1>
+  Signals, Timers, and Waiting
+</h1>
+<h4>
+    February 8, 2022
+</h4>
+
+<hr>
+
+<h3>
+Timers
+</h3>
+
+<p>
+Let's say that you're writing a program in which you need to coordinate between
+two threads, but want to do so in an infrequent, low-overhead manner. There are
+many ways that you can do this, but one of the convenient ones is to use
+signals. This works well if events happen pretty slowly in your program; think
+on the order of one second or more. For this use-case, signals offer ease-of-use
+and the ability to free up computing resources instead of busy-waiting on
+precise locks, polling file descriptors, or introducing unecessary overhead.
+</p>
+<p>
+Here's an example: you have a thread which you want to wake up every one second,
+read a structure, and update the UI. In that thread, you might do something like:
+</p>
+<ol>
+    <li>
+    Define a function which should happen each second.
+    <code>
+    
+void ui_thread_interval(int s) {
+    ...
+}
+    </code>
+    </li>
+    <li>
+    Set up a signal handler to call the function each time a signal is seen.
+    <code>
+    
+struct sigaction sa;
+int interval_signal;
+
+interval_signal = SIGRTMIN;
+sa.sa_flags = 0;
+sa.sa_handler = ui_thread_interval;
+sigemptyset(&sa.sa_mask);
+if(sigaction(interval_signal, &sa, NULL) == -1) {
+    fprintf(stderr, "Error creating interval signal handler. Aborting.\n");
+    exit(1);
+}
+    </code>
+    </li>
+    <li>
+    Block that signal. This is so that it won't happen before we've finished setting
+    things up.
+    <code>
+    
+sigset_t mask;
+
+sigemptyset(&mask);
+sigaddset(&mask, interval_signal);
+if(sigprocmask(SIG_SETMASK, &mask, NULL) == -1) {
+    fprintf(stderr, "Error blocking signal. Aborting.\n");
+    exit(1);
+}
+    </code>
+    </li>
+    <li>
+    Create a realtime timer to trigger that signal.
+    <code>
+    
+struct sigevent sev;
+timer_t interval_timer;
+    
+sev.sigev_notify = SIGEV_THREAD_ID;
+sev.sigev_signo = interval_signal;
+sev.sigev_value.sival_ptr = &interval_timer;
+sev._sigev_un._tid = syscall(SYS_gettid);
+if(timer_create(CLOCK_REALTIME, &sev, &interval_timer) == -1) {
+    fprintf(stderr, "Error creating timer. Aborting.\n");
+    exit(1);
+}
+    </code>
+    </li>
+    <li>
+    Set the timer to occur every second.
+    <code>
+
+struct itimerspec its;
+    
+its.it_value.tv_sec     = 1;
+its.it_value.tv_nsec    = 0;
+its.it_interval.tv_sec  = 1;
+its.it_interval.tv_nsec = 0;
+if(timer_settime(interval_timer, 0, &its, NULL) == -1) {
+    fprintf(stderr, "Error setting the timer. Aborting.\n");
+    exit(1);
+}
+    </code>
+    </li>
+    <li>
+    Unblock the signal.
+    <code>
+    
+if(sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1) {
+    fprintf(stderr, "Error unblocking signal. Aborting.\n");
+    exit(1);
+}
+    </code>
+    </li>
+</ol>
+
+<p>
+Once you're done, that thread should receive a <code>SIGRTMIN</code> approximately
+every one second, and that signal should cause <code>ui_thread_interval</code> to run.
+</p>
+
+<p>
+Often, this code is supplemented by a timer which records
+when each wakeup happens. Depending on whether the wakeup happens too late or
+early, <code>nanosleep</code> and simply ignoring signals can account for the
+difference. This helps keep a similar low overhead while ensuring slightly
+more accuracy if required.
+</p>
+
+<h3>
+Waiting
+</h3>
+
+<p>
+Now let's say that you've got another thread in your program, and you'd like for
+it to kill the thread when the program receives <code>SIGTERM</code>. You can
+simply do something like this, to wait on <code>SIGTERM</code> (without busy-waiting),
+and perhaps break from a loop and exit the thread when it occurs:
+</p>
+
+<pre>
+<code>
+sigset_t mask;
+int sig;
+
+sigemptyset(&mask);
+sigaddset(&mask, SIGTERM);
+if(sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+    fprintf(stderr, "Error blocking SIGTERM. Aborting.\n");
+    exit(1);
+}
+while(sigwait(&mask, &sig) == 0) {
+    if(sig == SIGTERM) {
+        break;
+    }
+}
+</code>
+</pre>

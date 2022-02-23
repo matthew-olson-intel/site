@@ -1,0 +1,214 @@
+<head>
+<link rel="stylesheet" href="../style.css">
+</head>
+
+<h1>
+AEP DIMM Reference
+</h1>
+<h4>
+October 17, 2019
+</h4>
+
+<hr>
+
+<h3>
+Introduction
+</h3>
+
+<p>
+I'm on a system with some Intel Optane Persistent Memory DIMMs, which contain
+large capacities of non-volatile memory. From here on out, I'll refer to them
+as "AEP", which stands for "Apache Pass", the memory technology that they use
+under the hood. The three most common ways of making this memory available to
+the operating system are:
+</p>
+
+<ol>
+    <li>
+    2LM mode (or Memory Mode, or Cache Mode), enabled in the BIOS, which uses
+    a number of DDR4 DIMMs as a cache for the AEP DIMMs.
+    </li>
+    <li>
+    Filesystems, in which you first enable 1LM mode, then install a filesystem
+    onto the AEP DIMMs to take advantage of their persistence.
+    </li>
+    <li>
+    NUMA mode, in which you enable 1LM mode, then bind the AEP DIMMs' memory regions
+    to a driver which makes them available as a NUMA node.
+    </li>
+</ol>
+
+In this post, I'm just going to lay out concisely how to get into the first and third modes.
+
+<h3>
+NUMA Mode
+</h3>
+
+<p>
+In order to get into NUMA mode:
+</p>
+
+<ol>
+    <li>
+    Ensure you've got a new enough kernel. It needs to be at least version <code>5.1.0-rc4</code>.
+    </li>
+    
+    <li>
+    Change the AEP to <code>1LM</code> mode in the BIOS.
+    </li>
+    
+    <li>
+    Use <code>ipmctl</code> to put each individual AEP DIMM into AppDirect mode:
+    To do this to all AEP on socket 0, do:
+    <br>
+    <code>ipmctl create -goal -socket 0 PersistentMemoryType=AppDirect</code>
+    </li>
+    
+    <li>
+    Reboot. Now the DIMMs that you chose from the previous command will show as one
+    distinct memory region in    <code>ipmctl</code>. However, you need
+    <code>ndctl</code> and <code>daxctl</code> to bind this region to the
+    appropriate kernel driver.    The <code>git checkout</code> command is only
+    necessary if you want to later use this utility to online your memory    as
+    <code>ZONE_NORMAL</code>, and if <code>v67</code> hasn't been released yet.
+    <br>
+    <code>git clone https://github.com/pmem/ndctl.git</code>
+    <br>
+    <code>git checkout 3fdaf7ed512ac564a78d6d2c7152be218e39c3c1</code>
+    </li>
+    
+    <li>
+    Build the project.
+    </li>
+    
+    <li>
+    Migrate the device model. This writes to the file <code>/etc/modprobe.d/daxctl.conf</code>. If it doesn't, then
+    you didn't globally install <code>daxctl</code> to your system (it hardcodes some paths, so running this command from
+    the source directory doesn't work). Reboot again.
+    </li>
+    
+    <li>
+    View the memory regions that you created with <code>ipmctl</code>, using <code>ndctl</code>:
+    <br>
+    <code>ndctl list -R</code>
+    </li>
+    
+    <li>
+    Create a namespace consisting of that region:
+    <br>
+    <code>ndctl create-namespace --region region0 -m dax</code>
+    </li>
+    
+    <li>
+    Ensure you *don't* have <code>dax_pmem_compat</code> running: 
+    <br>
+    <code>lsmod | grep "dax_pmem_compat"</code>
+    </li>
+    
+    <li>
+    Ensure you *do* have <code>kmem</code> running:
+    <br>
+    <code>lsmod | grep kmem</code>
+    </li>
+    
+</ol>
+
+<p>
+The last step has two methods, depending on whether you want the memory in
+<code>ZONE_NORMAL</code> or <code>ZONE_MOVABLE</code>. <a href=1.html>This post</a>
+explains this conundrum in excrutiating detail.
+</p>
+
+<p>
+If you have the kernel configuration <code>CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE</code>, you can
+manually bind the memory to the correct driver, and the kernel will automatically online
+the memory as <code>ZONE_NORMAL</code> for you:
+</p>
+
+<ol>
+    <li>
+    Find the device that you want to bind. Examples include <code>dax0.0</code>,
+    <code>dax1.0</code>, etc. This will list the namespaces, and within these should be
+    the device that they're associated with:
+    <br>
+    <code>ndctl list -N</code>
+    </li>
+
+    <li>
+    Unbind from the <code>device_dax</code> driver:
+    <br>
+    <code>echo dax0.0 > /sys/bus/dax/drivers/device_dax/unbind</code>
+    </li>
+
+    <li>
+    Bind to the <code>kmem</code> driver:
+    <br>
+    <code>echo dax0.0 > /sys/bus/dax/drivers/kmem/new_id</code>
+    </li>
+</ol>
+
+<p>
+If you don't have that configuration, then use the <code>daxctl</code> utility to do it
+for you. Keep in mind that if you have version <code>v66</code> and didn't do the <code>git
+checkout</code> command above, you won't have the <code>--no-movable</code> option.
+</p>
+
+<ol>
+    <li>
+    For <code>ZONE_MOVABLE</code>:
+    <br>
+    <code>daxctl reconfigure-device --mode=system-ram all</code>
+    </li>
+    
+    <li>
+    For <code>ZONE_NORMAL</code>:
+    <br>
+    <code>daxctl reconfigure-device --no-movable --mode=system-ram all</code>
+    </li>
+</ol>
+
+<h3>
+2LM Mode
+</h3>
+
+<p>
+In order to get back into 2LM mode:
+</p>
+
+<ol>
+    <li>
+    Switch to "2LM" mode in the BIOS.
+    </li>
+    
+    <li>
+    Disable and destroy all namespaces:
+    <br>
+    <code>ndctl list -N</code>
+    <br>
+    <code>ndctl disable-namespace namespace0.0</code>
+    <br>
+    <code>ndctl destroy-namespace namespace0.0</code>
+    </li>
+
+    <li>
+    Disable all regions:
+    <br>
+    <code>ndctl list -R</code>
+    <br>
+    <code>ndctl disable-region region0</code>
+    <br>
+    <code>ndctl disable-region region1</code>
+    </li>
+
+    <li>
+    Put all of each socket's memory in Memory Mode:
+    <br>
+    <code>ipmctl create -goal -socket 0 MemoryMode=100</code>
+    <br>
+    <code>ipmctl create -goal -socket 1 MemoryMode=100</code>
+    </li>
+
+    <li>
+    Reboot again.
+    </li>
+</ol>

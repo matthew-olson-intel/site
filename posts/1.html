@@ -1,0 +1,316 @@
+<head>
+<link rel="stylesheet" href="../style.css">
+</head>
+
+<h1>Memory Zone Subtleties</h1>
+<h4>September 13, 2019</h4>
+
+<hr>
+
+<h3>
+Introduction
+</h3>
+
+<p>
+This week, I had a particularly subtle issue that took me several days to find
+and fix. Although simple to fix, diagnosing the problem was difficult. This post
+involves a little tutorial on how to use Intel's AEP DIMMs, as well as
+descriptions of some issues that I encountered while using them.
+</p>
+
+<p>
+I'm on a system with some Intel Optane Persistent Memory DIMMs, which contain
+large capacities of non-volatile memory. From here on out, I'll refer to them as
+"AEP", which stands for "Apache Pass", the memory technology that they use under
+the hood. The three most common ways of making this memory available to the
+operating system are:
+</p>
+
+<ol>
+    <li>
+    2LM mode, enabled in the BIOS, which uses a number of DDR4 DIMMs as a cache for the AEP DIMMs.
+    </li>
+    <li>
+    Filesystems, in which you first enable 1LM mode, then install a filesystem onto
+    the AEP DIMMs to take advantage of their persistence.
+    </li>
+    <li>
+    NUMA mode, in which you enable 1LM mode, then bind the AEP DIMMs' memory regions
+    to a driver which makes them available as a NUMA node.
+    </li>
+</ol>
+
+<p>
+For my research, I'm particularly interested in the third option, since most of
+my tools assume that memory tiers will be accessible as NUMA nodes, and onlining
+a set of AEP DIMMs as a NUMA node would allow me to use those tools without
+modification.
+</p>
+
+<h3>
+Preparation
+</h3>
+
+<p>
+In general, these are the steps to prepare to go into NUMA mode:
+</p>
+
+<ol>
+    <li>
+    Ensure you've got a new enough kernel. It needs to be at least version `5.1.0-rc4`.
+    </li>
+    
+    <li>
+    Change the AEP to `1LM` mode in the BIOS.
+    </li>
+    
+    <li>
+    Use `ipmctl` to put each individual AEP DIMM into AppDirect mode:
+    To do this to all AEP on socket 0, do:
+    <br>
+    <code>
+    ipmctl create -goal -socket 0 PersistentMemoryType=AppDirect
+    </code>
+    <br>
+    Reboot.
+    </li>
+    
+    <li>
+    Now the DIMMs that you chose from the previous command will show as one distinct
+    memory region in    <code>ipmctl</code>. However, you need <code>ndctl</code>
+    and <code>daxctl</code> to bind this region to the appropriate kernel driver.
+    <br>
+    <code>
+    git clone https://github.com/pmem/ndctl.git
+    </code>
+
+    <li>
+    Build the project.
+    </li>
+    
+    <li>
+    Migrate the device model. This writes to the file
+    <code>/etc/modprobe.d/daxctl.conf</code>. If it doesn't, then     you didn't
+    globally install <code>daxctl</code> to your system (it hardcodes some paths, so
+    running this command from     the source directory doesn't work). Reboot again.
+    </li>
+    
+    <li>
+    View the memory regions that you created with <code>ipmctl</code>, using <code>ndctl</code>:
+    <br>
+    <code>
+    ndctl list -R
+    </code>
+    </li>
+
+    <li>
+    Create a namespace consisting of that region:
+    <br>
+    <code>
+    ndctl create-namespace --region region0 -m dax
+    </code>
+    </li>
+
+    <li>
+    Ensure you <em>don't</em> have <code>dax_pmem_compat</code> running: 
+    <br>
+    <code>
+    lsmod | grep "dax_pmem_compat"
+    </code>
+    </li>
+
+    <li>
+    Ensure you *do* have `kmem` running:
+    <br>
+    <code>
+    lsmod | grep kmem
+    </code>
+    </li>
+</ol>
+
+<h3>
+The Manual Way
+</h3>
+
+<p>
+The next step is where I've been confused. Initially, my version of the
+<code>daxctl</code> command didn't include any other commands: that is, from here on out,
+you had to manually bind the namespace to the proper kernel driver. To do this
+manually (again for a single memory region):
+</p>
+
+<ol>
+    <li>
+    Find the device that you want to bind. Examples include <code>dax0.0</code>,
+    <code>dax1.0</code>, etc. This will list the namespaces, and within these should be
+    the device that they're associated with:
+    <br>
+    <code>
+    ndctl list -N
+    </code>
+    </li>
+
+    <li>
+    Unbind from the <code>device_dax</code> driver:
+    <br>
+    <code>
+    echo dax0.0 > /sys/bus/dax/drivers/device_dax/unbind
+    </code>
+    </li>
+
+    <li>
+    Bind to the <code>kmem</code> driver:
+    <br>
+    <code>
+    echo dax0.0 > /sys/bus/dax/drivers/kmem/new_id
+    </code>
+    </li>
+</ol>
+
+<p>
+Once that's done, you should now check <code>numastat -m</code> to see if you've got a
+newly-created NUMA node. If it contains the capacity that you expect it to be,
+you're done.
+</p>
+
+<h3>
+The Automatic Way
+</h3>
+
+<p>
+However, one time I've encountered a situation in which this wasn't the case.
+Upon checking <code>numastat</code>, the node had a size of 0 bytes. Internet
+searches didn't seem to give any hints as to why this was. As it turns out,
+getting the newest version of <code>daxctl</code> (which includes the
+<code>online-memory</code>, <code>offline-memory</code>, and
+<code>reconfigure-device</code> commands) fixed my issue, but with a caveat.
+</p>
+
+<p>
+Using a new enough <code>daxctl</code>, the last three steps can be replaced by
+a simpler:
+<br>
+<code>
+daxctl reconfigure-device --mode=system-ram all
+</code>
+</p>
+
+<p>
+This will unbind the device from the old driver and rebind it to the new
+driver.  Crucially, though, it also <em>onlines</em> the memory regions, which is what
+I was missing when I encountered the 0-size NUMA node issue. Using this new
+method, the node now shows up with the appropriate capacity.
+</p>
+
+<h3>
+More Problems
+</h3>
+
+<p>
+On my system, I have two NUMA nodes of DDR, 0 and 1. Each of these is 96GB.
+Node 2 is the AEP on socket 0, while node 3 is the AEP on socket 1. So: to
+bind an application to the memory on socket 1 (while preferring DDR and spilling
+onto AEP), I do:
+</p>
+
+<code>
+numactl --preferred=1 numactl --membind=1,3 --cpunodebind=1 ./a.out
+</code>
+
+<p>
+For applications that use less than approximately 200GB of RAM, this works just
+fine.  However, upon scaling them to use more than 200GB, I start encountering
+issues: the OOM killer is suddenly killing my process, and if I set
+<code>vm.overcommit_memory</code> to 2 (thus forcing <code>malloc</code> to
+return <code>NULL</code> before allocating more memory than is available), the
+applications fail to allocate memory above ~200GB.
+</p>
+
+<p>
+Searching for this issue doesn't return many results, either, and I can't seem
+to figure out why those allocations are failing. If I ignore the DDR node,
+binding only to the AEP, all allocations succeed, and I can scale my
+application to use a peak RSS of more than 700GB. However, immediately upon
+preferring the DDR and spilling onto one of the AEP nodes, the kernel OOMs upon
+reaching around 200GB, despite there being nearly 600GB of free memory available
+on node 3.
+</p>
+
+<h3>
+Memory Zones
+</h3>
+
+<p>
+Nearly giving up, I finally check each of the memory regions that make up the
+AEP NUMA nodes. For node 3, checking the first gigabyte of memory looks like:
+</p>
+
+<code>
+cat /sys/bus/node/devices/node3/memory1000/state
+</code>
+
+<p>
+The value was <code>online</code>. However, upon checking
+<code>valid_zones</code> in the same directory, it seems that the memory is in
+<code>ZONE_MOVABLE</code>, not <code>ZONE_NORMAL</code>.
+</p>
+
+<p>
+<a href=https://lwn.net/Articles/224255/>Reading up on this</a>, it explains why
+I could manually bind to specifically that node and use its fully capacity, but
+not fault memory onto it. Since this memory was onlined as
+<code>ZONE_MOVABLE</code>, the most that the kernel can access is the minimum of
+what the other nodes have: that is, the more-than-700GB node of AEP can only
+have ~96GB faulted onto it, so that I get an OOM when I allocate above nearly
+200GB of memory (96GB of DDR, plus 96GB of AEP which I fault to). This also
+explains why binding directly to that node succeeds: userspace applications can
+still use the full capacity of the node just fine, and <code>numastat
+-m</code> shows the full amount.
+</p>
+
+<p>
+Searching further, I find out why the nodes were <code>ZONE_MOVABLE</code>: the
+<code>daxctl</code> command onlines them that way, by doing e.g.
+</p>
+
+<code>
+echo online_movable > /sys/bus/node/devices/node3/memory1000/state
+</code>
+
+<p>
+to each of the <code>memoryXXXX</code> directories for a particular node. While
+this is fine for an application that binds directly to that node, a subtle issue
+is that the node cannot be fully faulted onto if it has more capacity than the
+minimum of all of your other NUMA nodes (as will usually be the case for AEP).
+</p>
+
+<h3>
+The Solutions
+</h3>
+
+<p>
+The first and simplest solution is to modify <code>daxctl</code>. I chose this
+one, as it was the quickest to implement. For release version <code>v66</code>,
+I edited line 1095 of <code>daxctl/lib/libdaxctl.c</code> from
+<code>online_movable</code> to <code>online</code>, then recompiled, rebooted,
+and re-onlined the memory with this new version.
+</p>
+
+<p>
+For those that want to use the manual method, there are two more solutions.
+First, you can simply write a script that manually onlines each of the gigabytes
+of memory for your AEP regions. Your script would essentially iterate over each
+of the directories in <code>/sys/bus/node/devices/nodeX/</code>, and <code>echo
+online > state</code> for each of the <code>memoryXXXX</code> directories.  This
+would most likely be the simplest solution if you try the manual method above,
+but end up with a
+0-size NUMA node (and don't want to use <code>daxctl</code>).
+</p>
+
+<p>
+The solution that would be easier in the long-term, though, is to enable the
+kernel configuration <code>CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE</code>, which
+automatically onlines newly-hotplugged memory. The memory would then be
+immediately onlined into <code>ZONE_NORMAL</code> upon being bound to the
+<code>kmem</code> driver.
+</p>
